@@ -7,3 +7,12 @@ Une présentation est proposée [ici](https://docs.google.com/presentation/d/1UE
 # Tutoriel
 
 Le fichier tag_indicateurs.Rmd contient le code du tutoriel dont la version "compilée" `knitted` est tag_indicateurs.html.
+
+# Données
+
+- data/29032018_Index2.csv
+- 20180426_Dictionnaire des notions edited.xlsx
+- indicateurs_tagtreed2.txt
+- notions_lemmatized.txt
+- tagged_triplet_agreg.RData
+- trained_model.RData
