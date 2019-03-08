@@ -1,0 +1,1114 @@
+---
+title: "Tagging des indicateurs de santé"
+author: "Philéas Condemine"
+date: "11 mars 2019"
+output: 
+  html_document:
+    df_print: paged
+    toc: true
+    toc_float: true
+    toc_depth: 4
+---
+
+
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r packages, message=FALSE, warning=FALSE}
+library(data.table)
+library(stringi)
+library(dplyr)
+library(stringr)
+library(text2vec)
+library(readxl)
+library(Matrix)
+library(text2vec)
+library(rdrop2)
+library(ggplot2)
+library(plotly)
+library(magrittr)
+library(stringdist)
+library(xgboost)
+# GESTION DE LA CONVERSION DES NOMBRES EN CHAINE DE CARACTERES SANS UTILISER LA NOTATION SCIENTIFIQUE
+# https://stackoverflow.com/questions/5352099/how-to-disable-scientific-notation
+options("scipen"=100, "digits"=10) 
+```
+
+# Préparation des données
+
+## Base des indicateurs
+
+### Aperçu
+
+```{r main data read}
+data2 <- fread("data/29032018_Index2.csv",encoding="Latin-1")
+nb_indicateurs=nrow(data2)
+
+```
+
+Le jeu de données contient `r print(nb_indicateurs)` indicateurs.
+
+Les données sont principalement textuelles, certaines peut-être plus exploitables que d'autres.
+
+```{r head and names}
+names(data2)
+head(data2,2)#Un View(head(data2,100)) sera peut-être plus approprié pour vous.
+```
+
+### Variables doublons
+
+La variable `index` est présente deux fois !
+
+On vérifie que c'est bien les mêmes valeurs les deux fois puis on supprime
+```{r rm double index}
+data2[c(!data2[,1]==data2[,27]),c(1,27)]
+data2[,27] <- NULL
+```
+La variable `Base` est présente deux fois !
+
+Même procédure, on observe des différences mais c'est seulement des problèmes de majuscules.
+```{r rm double base}
+head(data2[c(!data2[,2]==data2[,22]),c(2,22)])
+data2[c(!tolower(data2[,2])==tolower(data2[,22])),c(2,22)]
+
+data2[,22] <- NULL
+```
+
+
+
+En particulier certaines méritent peut-être un pré-traitement, par exemple les noms des producteurs INSEE, DREES, CNAMTS écrit en plein texte.
+
+```{r check producteurs acronymes}
+head(sample(data2$Producteur))
+```
+
+### Traitement des acronymes avec des expressions régulières
+
+Commençons par une expression régulière pour récupérer le texte entre parenthèses (acronyme)
+
+```{r acro prod}
+data2$producteur_acronyme=data2$Producteur%>%
+  stri_extract_all(regex = "(\\()([A-z]+)(\\))")%>%#On récupère LES chaînes de caractères entre parenthèses
+  lapply(function(x)paste(x,collapse=" "))%>%# On les colle
+  unlist%>%gsub(pattern = '(\\()|(\\))',replacement = '') # On met en vecteur et on supprime les parenthèses
+data2[producteur_acronyme=="NA",producteur_acronyme:=Producteur]#On gère les noms sans acronyme
+table(data2$producteur_acronyme)%>%head
+```
+
+
+Même idée pour la source
+
+```{r acro source}
+data2$source_acronyme=data2$Source%>%
+  stri_extract_all(regex = "(\\()([A-z]+)(\\))")%>%#On récupère LES chaînes de caractères entre parenthèses
+  lapply(function(x)paste(x,collapse=" "))%>%# On les colle
+  unlist%>%gsub(pattern = '(\\()|(\\))',replacement = '') # On met en vecteur et on supprime les parenthèses
+data2[source_acronyme=="NA",source_acronyme:=Source]#On gère les noms sans acronyme
+table(data2$source_acronyme)%>%head
+```
+
+### Suppression des stop-words
+
+Pour remplacer plusieurs mots d'un coup, `stringr` propose une fonction polymorphe très pratique `str_replace_all`. Lorsqu'on fournit un vecteur nommé à la place des paramètres `pattern` et `replacement`, la fonction est appliquée au vecteur de sorte que pour chaque entrée du vecteur, le nom joue le rôle de `pattern` et la valeur joue le rôle de `replacement`.
+
+On commence par construire notre liste de stopwords.
+```{r create stopwords}
+stop_words = tm::stopwords(kind="fr")
+# stop_words=c(stop_words,"actifs part entière APE")
+stop_words=paste0(" ",stop_words," ")
+stop_words=c(stop_words," c'"," l'"," d'"," j'"," t'"," m'"," s'")
+fix_stop=rep(" ",length(stop_words))
+names(fix_stop) <- stop_words
+```
+
+Puis on passe en minuscules, on supprime les stopwords puis les espaces en trop.
+```{r rm stopwords}
+data2 <- data2%>%
+  mutate(Indicateur=as.character(Indicateur))%>%#passage en char
+  mutate_if(is.character,tolower)%>%#en minuscules
+  mutate_if(is.character,function(x)str_replace_all(x,fix_stop))%>%#suppression de stopwords génériques et spécifiques
+  mutate_if(is.character,tm::stripWhitespace)#suppression des doubles espaces
+
+```
+
+
+### Suppression des colonnes constantes
+
+```{r rm const cols}
+cardinality=sapply(data2,function(x)length(unique(x)))
+head(cardinality)
+data2=data2[,cardinality>1]
+```
+
+
+### Construction du bloc de texte
+
+```{r build text vec}
+data2$Indicateur_enriched=paste(data2$Indicateur,
+                                data2$Famille,
+                                data2$`Classement producteur Niveau 1 (le moins détaillé)`,
+                                data2$`Classement producteur Niveau 2`,
+                                data2$`Classement producteur Niveau 3 (le plus détaillé)`,
+                                data2$source_acronyme,data2$producteur_acronyme)
+```
+
+Longueur du texte :
+```{r nb chars text}
+nchar(data2$Indicateur)%>%hist(main="Distribution du nombre de caractères dans le texte")
+```
+
+On va compter les espaces pour se donner une idée du nombre de mots
+```{r nb words text}
+str_count(data2$Indicateur," ")%>%hist(main="Distribution du nombre de mots dans le texte")
+```
+
+## Les tags
+
+### Aperçu 
+
+Chaque indicateur taggé par machine learning a ensuite été validé par son producteur qui nous a renvoyé un fichier excel, ce qui fait une trentaine de fichiers Excel homogénéisés et empilés. On sautera cette étape et on travaillera directement sur le fichier intermédiaire : `tagged_triplet_agreg.RData`
+```{r load tags}
+load("tagged_triplet_agreg.RData")
+```
+
+La fameuse liste des tags.
+```{r nm tags}
+names(tagged)
+names(tagged) <- tolower(names(tagged))
+```
+
+
+Pour l'instant on dispose d'un tableau avec une ligne par indicateur et pour chaque colonne un 'top' tag ie un booléen qui nous indique si le tag est appliqué.
+
+
+```{r head tags}
+head(tagged[,1:10])
+```
+
+### Nombre de tags par indicateur
+
+Si on aime le jargon ADD (ACM) on peut parler de tableau disjonctif de la variable 'tag' à ceci près que plusieurs modalités sont possibles en même temps...
+
+Justement, combien de tags par indicateur ?
+```{r}
+rowSums(tagged%>%select(-index))%>%hist
+```
+
+### Fréquence des tags
+
+On a donc principalement entre 2 et 4 tags par indicateur.
+
+Maintenant quelle est la fréquence de chaque tag ?
+
+```{r}
+sapply(tagged,mean)[-1]%>%
+  data.table(name=names(.),freq=.)%>%{
+  ggplot(data=.,aes(x=name,y=freq))+
+      geom_bar(stat="identity")+ 
+      theme(axis.title.x=element_blank(),
+        axis.text.x=element_blank(),
+        axis.ticks.x=element_blank())}%>%
+  ggplotly
+```
+
+### Corrélation des tags
+
+On calcule les corrélations entre les tags et on supprime (met à 0) celle inférieure à 10% et celles à 1 qui vont polluer visuellement le graphe.
+```{r}
+cor_mat=cor(tagged%>%select(-index))
+cor_mat[abs(cor_mat)<.1] <- 0
+cor_mat[cor_mat==1] <- 0
+```
+
+Ce package ne gère par les valeurs négatives donc on prendra les valeurs absolues.
+```{r}
+chorddiag::chorddiag(abs(cor_mat),showTicks = F,showGroupnames = F)
+```
+
+Cette information sur la corrélation entre les tags est importante. Elle devra orienter notre choix méthodologique. En effet on ne peut pas considérer que les tags sont indépendants.
+
+### Matrice sparse
+
+La densité de la matrice de tags vaut `r tagged%>% select(-index)%>%{mean(sapply(.,mean))*100}%>%round(digits = 1)
+` %.
+
+On préfère le format triplet qui nous servira ensuite pour une représentation en matrice creuse (sparse)
+
+```{r}
+tagged_triplet=reshape::melt(tagged,id.vars="index")
+
+head(tagged_triplet)
+```
+
+## Base indicateurs x tags
+
+### Jointure
+```{r}
+tagged_triplet=merge(tagged_triplet,data2%>%select(index,Base,Indicateur),by="index") %>% mutate_if(is.factor,as.character)
+
+tagged_triplet %<>% rename(id=index)
+tagged_triplet=data.table(tagged_triplet)
+```
+
+### Numérotation des lignes
+
+On récupère la liste des tags pour les numéroter.
+```{r}
+tags <- unique(tagged_triplet$variable)
+tags_corres=data.frame(tags=tags,tag_id=1:length(tags),stringsAsFactors = F)
+tagged_triplet=merge(tagged_triplet,tags_corres,by.x="variable",by.y="tags")
+
+```
+
+On numérote les lignes issues du croisement indicateur x tag pour pouvoir ensuite définir manuellement une matrice sparse exploitable par XGBOOST.
+
+```{r}
+tagged_triplet <- tagged_triplet%>%mutate(i=(tag_id-1)*nb_indicateurs+id)#%>%select(-tag_id)
+```
+
+On gère les problèmes de doublons et on récupère les numéros des indicateurs qui ont été taggés, c'est uniquement sur ces indicateurs qu'on pourra entraîner/vérifier le modèle.
+
+```{r}
+tagged_triplet=data.table(tagged_triplet)[,.SD[1],by="i"]
+tagged_ids = unique(tagged_triplet$id)
+```
+
+
+### Vectorisation du text avec text2vec
+
+#### Les tags
+
+On remplace les séparateurs _ par des espaces pour que la fonction reconnaisse les tokens.
+
+Pour les tags on va un peu vite parce qu'il n'y a pas beaucoup d'enjeux, on est sur quelques dizaines de mots, chaque est important. 
+**On décide de cette approche parce qu'on pense que le mots "soin", "offre", "population", "maladie", "pathologie", etc. qui sont présents dans plusieurs tags, devraient être pris en compte par le modèle.**
+
+```{r}
+tags_dtm <- tags%>%
+  gsub(pattern = "_",replacement = " ")%>%#conversion _ en " "
+  str_replace_all(fix_stop)%>%#suppression des stopwords
+  itoken(tolower,word_tokenizer)%>% # extraction des tokens
+  {create_dtm( # Création d'un dtm...
+    vocab_vectorizer( # A partir de la matrice du texte vectorisé ...
+      create_vocabulary(.,ngram=c(1L,3L)) # A partir d'un vocabulaire de 1 grams à 3 grams
+    ),it=.)
+  }
+dimnames(tags_dtm)[[1]] <- tags
+
+```
+
+Le problème c'est qu'on a créé beaucoup d'hapax ie des façons différentes de représenter le même tag ! On veut supprimer ces doublons.
+
+```{r}
+col_to_rm=c()
+for (i in 1:(ncol(tags_dtm)-1)){
+  for(j in (i+1):ncol(tags_dtm)){
+    if(sum(tags_dtm[,i]==tags_dtm[,j])==nrow(tags_dtm)){
+    col_to_rm=c(col_to_rm,j)
+    }
+  }
+}
+col_to_rm=sort(unique(col_to_rm))
+```
+
+Chaque tag contient : 
+
+- Une représentation si c'est suffisant (aucun mot partagé avec les autres tags)
+- Plusieurs si certains des mots (ou ngram) sont présents dans d'autre tags
+
+```{r}
+tags_dtm=tags_dtm[,-col_to_rm]
+rowSums(tags_dtm)
+```
+
+La vision complémentaire : les termes présents dans plusieurs tags
+```{r}
+colSums(tags_dtm)%>%sort(decreasing = T)%>%head(10)
+```
+
+
+On garde ces informations sur les tags pour plus tard
+```{r}
+i_tags=summary(tags_dtm)$i
+j_tags=summary(tags_dtm)$j
+dimnm_tags=dimnames(tags_dtm)
+```
+
+
+
+#### Les indicateurs
+
+On commence par appliquer des standardisations avancées au texte : suppression des accents, stemming ou lemmatisation.
+
+##### Stemming 
+
+Si vous voulez tester, vous pouvez reprendre le code du TD text-mining avec le package `SnowballC`. N'oubliez pas de "remplir" le stem avec `stemCompletion` du package `tm` afin d'obtenir un résultat un minimum lisible.
+
+##### Lemmatisation
+
+On commence par placer le texte dans un vecteur et supprimer les accents.
+```{r}
+text <- data2$Indicateur_enriched
+text=iconv(text,from="UTF-8",to="ASCII//TRANSLIT")
+```
+
+Pour commencer il faut installer treetagger et ajouter les variables d'environnement pour pouvoir l'appeler en ligne de commande.
+
+...
+
+On ajoute "azerty" pour servir de séparateur d'indicateursles caractères spéciaux même rares comme | sont déjà présents dans le txt
+
+```{r}
+fwrite(x = list(paste(text,"azerty")),"indicateurs.txt")
+readLines("indicateurs.txt",3)
+```
+
+On lance treeTagger : ça prend 12 secondes sur mon X270. C'est vraiment rapide. SINON si on devait gérer un texte plus long on commencerait par extraire le vocabulaire et on appliquerait treeTagger uniquement sur le vocabulaire pour éviter d'appliquer plusieurs fois les mêmes opérations...
+** Au cas où vous auriez des difficultés à installer treeTagger, je vous ai fourni le fichier `indicateurs_tagtreed2.txt`**
+```{r eval=F}
+system.time(system("tag-french indicateurs.txt > indicateurs_tagtreed2.txt")) 
+```
+
+On regarde ce que ça donne.
+```{r}
+tagged_parsed=fread("indicateurs_tagtreed2.txt",fill=T,header=F)
+names(tagged_parsed) <- c("mot_original","type_de_mot","mot_lemme")
+head(tagged_parsed,10)
+tail(tagged_parsed,10)
+tagged_parsed=tagged_parsed[-nrow(tagged_parsed),]# on supprime la dernière ligne, pas besoin du dernier séparateur.
+```
+
+On peut regarder comment les mots ont été taggés (**on parle de tags là aussi... attention au risque de confusion**)
+```{r}
+tagged_parsed[grep("cardio",tagged_parsed$mot_original),]
+```
+
+En investiguant les différents tags on identifie deux tags inutiles relatifs à la ponctuation et aux nombres.
+```{r}
+tagged_parsed%>%filter(mot_lemme=="@card@")%>%head
+```
+
+```{r}
+tagged_parsed%>%filter(type_de_mot=="SENT")%>%head
+```
+
+On les supprime : 
+
+```{r}
+ajustement_text=tagged_parsed%>%
+  filter(!type_de_mot%in%c("PUN","SENT"))%>%
+  mutate(text_ajuste=ifelse(type_de_mot=="NUM",mot_original,mot_lemme))
+```
+
+Puis on reconstitue notre vecteur d'indicateurs lemmatisés et nettoyés
+
+```{r}
+big_txt=paste(ajustement_text$text_ajuste,collapse=" ")
+split_txt=strsplit(big_txt,split = "azerty")
+split_txt=iconv(unlist(split_txt),'UTF-8','latin1')
+head(sample(split_txt))
+```
+
+
+
+Comme précédent on génère le vocabulaire sur les n-grams 1-3 avec les fonctions de text2vec
+
+```{r}
+tokens = word_tokenizer(split_txt)
+it = itoken(tokens, progressbar = FALSE)
+vocab = create_vocabulary(it, ngram = c(1L, 3L))
+vocab_init=nrow(vocab)
+vocab = prune_vocabulary(vocab, term_count_min = 3L)
+vocab_pruned_freq=nrow(vocab)
+```
+
+On est très léger sur le filtrage du vocabulaire, on a seulement supprimé les termes présents moins de 3 fois... On est parti d'un vocabulaire de taille `r vocab_init` pour arriver à un vocabulaire de taille `r vocab_pruned_freq`.
+
+
+On jongle entre les formats de matrices creuses, essayez de comprendre ce qui diffère entre les diverses représentations dgTMatrix, dgCMatrix, ngCMatrix...
+
+```{r}
+vectorizer = vocab_vectorizer(vocab)
+dtm=create_dtm(it,vectorizer,type = "dgCMatrix")
+dtm=as(dtm, "ngCMatrix")
+```
+
+
+Finalement on récupère les informations qui nous intéressent pour construire par la suite une matrice sparse dans un autre format, celui ingéré par xgboost.
+```{r}
+i=summary(dtm)$i
+j=summary(dtm)$j
+dimnm=dimnames(dtm)
+```
+
+### Les notions
+
+#### Aperçu 
+
+Avec des experts médicaux on a construit une liste de synonymes ou notions clefs qui permettent d'attribuer un tag à un indicateur. On va utiliser cette liste pour gérer le tagging des cas triviaux.
+```{r}
+notions <- readxl::read_xlsx("20180426_Dictionnaire des notions edited.xlsx")
+names(notions) <- tolower(names(notions))
+names(notions)[!names(notions)%in%tags]
+```
+
+```{r eval=FALSE, include=FALSE}
+methods=c("osa",
+"lv",
+"dl",
+"hamming",
+"lcs",
+"qgram",
+"cosine",
+"jaccard",
+"jw",
+"soundex")
+tags_esc=tags%>%gsub(pattern="_",replace=" ")%>%tm::stripWhitespace()%>%tolower()
+nm_notions=names(notions)%>%gsub(pattern="_",replace=" ")%>%tm::stripWhitespace()%>%tolower()
+
+matching=lapply(methods,function(method)stringdist::amatch(nm_notions,tags_esc,method = method,maxDist = .5,q=3))%>%
+  do.call(what="rbind")
+matching <- tags[matching] %>%matrix(ncol=length(nm_notions))
+colnames(matching) <- names(notions)
+View(matching)
+```
+
+On empile les colonnes et on traite le texte (passage en lettres minuscules)
+```{r}
+notions <- lapply(1:ncol(notions),function(i){
+  data.frame(notion=names(notions)[i],termes=unname(notions[,i]))%>%
+    na.omit%>%
+    mutate_all(as.character)
+}
+)%>%
+  do.call(what = "rbind")%>%
+  mutate(termes=tolower(termes))
+
+head(notions)
+nrow(notions)
+```
+
+On supprime les accents et on lemmatise
+
+```{r eval=F}
+notions_txt=notions$termes
+notions_txt=iconv(notions_txt,from="UTF-8",to="ASCII//TRANSLIT")
+fwrite(x = list(paste(notions_txt,"azerty")),"notions_2B_lem.txt")
+readLines("notions_2B_lem.txt",10,encoding = "utf8")
+system.time(notions_lemmed <- system("tag-french notions_2B_lem.txt",intern = T))
+fwrite(list(notions_lemmed),"notions_lemmatized.txt")
+```
+
+On effectue les mêmes traitements que précédemment : on supprime les ponctuations et nombres... et on reconstruit le vecteur de texte.
+
+**Attention, il est nécessaire d'appliquer strictement les mêmes transformations sur le texte des indicateurs et le texte des notions afin de pouvoir apparier (grep) les deux.**
+
+Encore une fois, si treeTagger ne fonctionne pas sur votre poste, il vous suffit de récupérer `notions_lemmatized.txt`.
+```{r}
+notions_lemmatized=fread(input = "notions_lemmatized.txt",sep="\t",fill=T,header=F)
+names(notions_lemmatized) <- c("mot_original","type_de_mot","mot_lemme")
+notions_lemmatized=notions_lemmatized[1:(nrow(notions_lemmatized)-4)]
+notions_lemmatized=notions_lemmatized%>%
+  filter(!type_de_mot%in%c("PUN","SENT"))%>%
+  mutate(text_ajuste=ifelse(type_de_mot=="NUM",mot_original,mot_lemme))
+notions_lemmatized=paste(notions_lemmatized$text_ajuste,collapse=" ")
+stringr::str_count(notions_lemmatized,"azerty")
+notions_lemmatized=strsplit(notions_lemmatized,split = "azerty")[[1]]
+sum(stringr::str_count(notions_lemmatized,"azerty"))
+head(notions_lemmatized)
+notions_lemmatized=tm::stripWhitespace(notions_lemmatized)
+notions_lemmatized=gsub("^ ","",notions_lemmatized)
+notions_lemmatized=gsub(" $","",notions_lemmatized)
+length(notions_lemmatized)==nrow(notions)
+notions$termes=notions_lemmatized
+notions=unique(notions)
+```
+
+#### Matching avec les indicateurs
+
+On va construire une variable (qui sera la dernière variable du tableau, après la vectorisation du texte) à partir des notions qui nous indique si l'un des termes relatifs à un tag est présent pour un indicateur. La fonction centrale est `str_which`.
+
+```{r}
+notions$tag_id=sapply(notions$notion,function(x)which(tags==x))
+nb_ngram_indic=max(j)
+nb_features=max(j)+max(j_tags)
+
+system.time(match_notions_indic <- do.call("rbind",pbapply::pbsapply(1:nrow(notions),
+         function(index){
+           matching=str_which(pattern = paste0("(^|( ))(",notions$termes[index],")(( )|($))"),
+                              string = split_txt)#text
+           if(length(matching)>0){
+             data.frame(i= matching,
+                        tag_id=notions$tag_id[index],
+                        j=nb_features+1,notion=notions$termes[index], stringsAsFactors = F)
+           } else NULL
+         }
+)))
+head(match_notions_indic)
+```
+
+- i => ligne = numéro de l'indicateur récup avec split_txt
+- j => colonne = numéro du token dans la sparse matrix
+- tag_id => tag associé
+- N'oubliez pas qu'on fera un modèle binomial ie indicateur x tag = TRUE/FALSE
+
+
+#### Pertinence des notions
+
+```{r}
+tags_ok=tagged_triplet
+tags_ok=merge(match_notions_indic,tags_ok,by.x=c("i","tag_id"),by.y=c("id","tag_id"),all.y=T)
+
+table(!is.na(tags_ok$j)# On a fait une jointure à droite donc !is.na signifie qu'il y a eu matching notion <-> indicateur
+      ,tags_ok$value # 1 = tag ok pour cet indic, 0 = tag ko pour cet indic
+      )
+
+```
+
+Plus précisément, investiguons les termes problématiques.
+```{r}
+table(tags_ok$notion# les notions qui génèrent le tagging automatique
+      ,tags_ok$value # 1 = tag ok pour cet indic, 0 = tag ko pour cet indic
+      )
+```
+
+psychoactives, cannabis, radiothérapie sont des "notions" proposées par des experts mais "refusées"" par d'autres qui effectuent le tagging manuel.
+On en reste là pour l'analyse de la cohérence des notions, on va passer à la suite mais d'abord...
+
+
+On supprime les doublons.
+
+```{r}
+match_notions_indic=unique(match_notions_indic[,c("i","tag_id","j")])
+```
+
+
+### Agrégation
+
+Ce qui peut sembler surprenant jusque là c'est qu'on a construit une grosse dtm avec tout le vocabulaire sur les indicateurs, mais pour l'apprentissage on pourra se servir uniquement du vocabulaire observé dans les indicateurs taggés !
+
+La motivation est de pouvoir rapidement intégrer les éléments de vocabulaires lorsqu'un nouvel indicateur est taggé, on aura besoin de cette flexibilité pour réaliser l'active learning.
+
+#### Préparation des objets à agréger
+
+On utilise `expand.grid` pour produire la table de croisement indicateurs x tags. Vous avez probablement déjà utilisé `expand.grid` pour réaliser des grid-search dans les cours de machine learning.
+
+```{r}
+nb_ngram_indic <- max(j)
+match_notions_indic <- match_notions_indic%>%mutate(id=(tag_id-1)*nb_indicateurs+i)%>%select(-i,-tag_id)
+# tags_corres=data.frame(tags=tags,tag_id=1:length(tags))
+
+i2 <- expand.grid(tag_id=1:length(tags),ind_id=i)%>%
+  mutate(id=(tag_id-1)*nb_indicateurs+ind_id)%>%.$id
+j2 <- expand.grid(tag_id=1:length(tags),j=j)%>%.$j
+length(text)==nb_indicateurs
+i_tags2 <- expand.grid(tag_id=i_tags,ind_id=1:length(text))%>%mutate(id=(tag_id-1)*nb_indicateurs+ind_id)%>%.$id
+j_tags2 <- expand.grid(j_tags=j_tags,ind_id=1:length(text))%>%.$j_tags
+
+j_tags2 <- j_tags2+nb_ngram_indic
+
+i_dimname <- data.frame(i2)%>%distinct%>%.$i2
+
+```
+
+On vérifie la cohérence. Si tout est à 0 c'est que ça fonctionne
+```{r}
+sum(!(unique(i_tags2)%in%i_dimname))
+sum(!(unique(match_notions_indic$id)%in%i_dimname))
+sum(!(unique(i2)%in%i_dimname))
+
+```
+
+#### Génération de la matrice creuse
+
+Et on génère la matrice sparse avec la fonction du package `Matrix`.
+```{r}
+dtm_sp <- sparseMatrix(i=c(i2,i_tags2,
+                           match_notions_indic$id),
+                       j=c(j2,j_tags2,match_notions_indic$j),
+                       dimnames = list(1:max(i_dimname)%>%as.character,
+                                       c(dimnm[[2]],
+                                         paste0("__",dimnm_tags[[2]]),
+                                         "notions")))
+```
+
+#### Taille des objets
+
+On compare la taille des différents objets
+```{r}
+object.size(dtm_sp)
+object.size(i2)+object.size(i_tags2)+object.size(match_notions_indic$id)
+object.size(j2)+object.size(j_tags2)+object.size(match_notions_indic$j)
+object.size(list(1:max(i_dimname)%>%as.character,
+              c(dimnm[[2]],paste0("__",dimnm_tags[[2]]),"notions")))
+
+```
+
+#### Vérifications
+
+On tire un indicateur au hasard et on vérifie sa cohérence.
+
+Pour commencer on vérifie si le tag et l'indicateur sont placés tel qu'on l'a imaginé et si les ngrams sont cohérents.
+
+```{r}
+index_test=sample(max(i2),1)
+data2[data2$index==index_test%%nb_indicateurs,]$Indicateur
+tags[(index_test-1)%/%nb_indicateurs+1]# le tag associé
+i_variantes=as.character(0:(length(tags)-1)*nb_indicateurs+index_test%%nb_indicateurs)
+i_variantes%in%dimnames(dtm_sp)[[1]]#ces index existent-ils dans la dtm ?
+ngrams=dtm_sp[index_test,]
+ngrams=names(ngrams[ngrams])
+ngrams # les ngrams de l'indicateur x tag
+```
+
+Ensuite on vérifie les notions présentes dans cet indicateur
+
+```{r}
+dtm_sp[index_test,"notions"]
+dtm_sp[i_variantes,"notions"]
+data2[data2$index==index_test%%nb_indicateurs,]$Indicateur
+tags[dtm_sp[i_variantes,"notions"]]
+```
+
+
+# Machine Learning
+
+On va maintenant passer à l'étape de construction du modèle de généralisation du  tagging avec séparation des données en échantillons d'entraînement et de test.
+
+## Préparation
+
+### Echantillonnage train-test
+
+On échantillonne sur les indicateurs et non directement sur les couples indicateurs x tags.
+```{r}
+train_smp=sample(tagged_ids,size = round(.75*length(tagged_ids)))
+test_smp = setdiff(tagged_ids, train_smp)
+train_ind=rowSums(expand.grid((1:length(tags)-1)*nb_indicateurs,train_smp))
+test_ind=rowSums(expand.grid((1:length(tags)-1)*nb_indicateurs,test_smp))
+```
+
+### Bases de train-test
+
+On va sélectionner uniquement les colonnes pertinentes pour l'apprentissage pour ça on a recours à `colSums` pour vérifier si les colonnes sont constantes égales à 0. 
+
+Remarque : **Cette pratique nous donne une piste pour l'active learning, on pourra demander au métier de tagger en priorité les indicateurs les moins bien représentés par le vocabulaire actuellement taggé**
+
+
+```{r}
+ngrams_tagged <- which(colSums(dtm_sp[c(train_ind,test_ind),])>0)
+  knowns_ind <- tagged_triplet[tagged_triplet$id%in%train_ind,][['i']] 
+  train_ind <- train_ind[train_ind%in%knowns_ind]
+  train_ind <- sort(train_ind)
+  train_labels <- tagged_triplet[tagged_triplet$id%in%train_ind,]%>%
+    arrange(i)%>%.[['value']]
+  train_dtm <- dtm_sp[train_ind,ngrams_tagged]
+  dtrain <- xgb.DMatrix(data = as(train_dtm,"dgCMatrix"), 
+                        label = train_labels)
+  ## Même chose pour le test qui va aussi nous servir de validation ici parce qu'on ne fait pas de gridsearch.
+  knowns_ind <- tagged_triplet[tagged_triplet$id%in%test_ind,][['i']] 
+  test_ind <- test_ind[test_ind%in%knowns_ind]
+  test_ind <- sort(test_ind)
+  test_labels <- tagged_triplet[tagged_triplet$id%in%test_ind,]%>%
+    arrange(i)%>%.[['value']]
+  test_dtm <- dtm_sp[test_ind,ngrams_tagged]
+  dtest <- xgb.DMatrix(data = as(test_dtm,"dgCMatrix"), 
+                        label = test_labels)
+  watchlist <- list(train = dtrain,eval = dtest)
+```
+
+### Entraînement
+
+On propose deux stratégies d'apprentissage, la première `slow` robuste et lente pour le **modèle final**, la seconde `fast` est plus rapide et "suffisante" pour évaluer le modèle régulièrement, une dernière `superfast` cherche à se rapprocher de l'instantanéité pour faire de **l'active learning** mais concrètement c'est difficile une fois qu'on n'est plus sur qqcentaines d'indicateurs taggés mais qqmilliers alors on se contente de 10-30 secondes.
+```{r}
+timing="superfast"
+if (timing=="slow"){
+params=list(eta=.1,
+            max_depth=6,
+            min_child_weight=5,
+            subsample=500*length(tags)/length(train_ind),
+            colsample_bytree=8000/length(ngrams_tagged),
+            objective="binary:logistic",
+            eval_metric="auc",
+            gamma=.01)
+nrounds=5E+3
+} else if (timing=="fast"){
+  params=list(eta=.2,
+              max_depth=6,
+              min_child_weight=1,
+              subsample=500*length(tags)/length(train_ind),
+              colsample_bytree=1000/length(ngrams_tagged),
+              objective="binary:logistic",
+              eval_metric="auc",
+              gamma=.01)
+  nrounds=2E+2
+} else if (timing=="superfast"){
+  params=list(eta=.1,
+              max_depth=3,
+              min_child_weight=1,
+              subsample=500*length(tags)/length(train_ind),
+              colsample_bytree=5000/length(ngrams_tagged),
+              objective="binary:logistic",
+              eval_metric="auc",
+              gamma=.01)
+  nrounds=1E+2
+}
+```
+
+On lance xgboost. Je vous invite à prendre le temps jouer sur les différentes paramètres, un gridsearch greedy sera trop long parce que chaque itération dure 30, 60, 120 secondes... mais essayer de jouer avec les paramètres 1 à 1 pour comprendre ce qui se passe.
+
+Par exemple, on remarquera que le choix du `colsample_bytree` est décisif.
+
+```{r eval=F}
+system.time(xgbmodel <- xgb.train(params = params,dtrain,
+                                  verbose = 1,print_every_n = 10,
+                                  nrounds = nrounds,watchlist,
+                                  early_stopping_rounds=200))
+save(xgbmodel,file="trained_model.RData")
+```
+
+
+```{r}
+load("trained_model.RData")
+```
+
+## Analyse des résultats
+
+### Importance des variables (ngrams)
+
+Les ngrams précédés de __ sont ceux relatifs aux tags.
+
+Le feature `notions` est la variable générée à partir du dictionnaire des notions. Elle devrait fonctionner à tous les coups mais on a vu que ce n'est pas toujours le cas.
+
+- **Gain** contribution of each feature to the model. For boosted tree model, each gain of each feature of each tree is taken into account, then average per feature to give a vision of the entire model. Highest percentage means important feature to predict the label used for the training (only available for tree models);
+
+- **Cover** metric of the number of observation related to this feature (only available for tree models);
+
+- **Weight** percentage representing the relative number of times a feature have been taken into trees.
+
+```{r}
+imp=xgb.importance(feature_names = NULL,xgbmodel)
+head(imp,30)
+```
+
+### Ngrams les plus importants par indicateur
+
+```{r}
+get_imp_ngrams=data.table(i=i,j=j)
+dico_ngrams=data.frame(j=1:max(j),ngram=dimnm[[2]])
+get_imp_ngrams=merge(get_imp_ngrams,dico_ngrams,by="j")
+
+get_imp_ngrams=merge(get_imp_ngrams,imp,by.x="ngram",by.y="Feature")
+
+setorder(get_imp_ngrams,-Gain)
+get_imp_ngrams[,order:=1:.N,by="i"]
+get_imp_ngrams=get_imp_ngrams[order<=10]
+
+get_imp_ngrams=dcast(get_imp_ngrams,i~order,value.var="ngram")
+
+get_imp_ngrams=merge(get_imp_ngrams,data2[,c("index","Indicateur")],by.x="i",by.y="index")
+
+sample_n(get_imp_ngrams%>%select(-i),10)
+```
+
+On remarque que des stopwords nous ont échappé... mais manifestement ils n'étaient pas si "creux" puisque le modèle les a retenu.
+
+Si on voit les choses autrement, on peut se dire que lorsque le ngram influent est un stopwords, les autres ngrams moins influents ne sont probablement pas pertinent.
+De plus si LE ngram le plus influent est un stopword, alors l'indicateur est probablement mal taggé...
+
+## Prédiction
+
+### Séparation des indicateurs non taggés
+
+On construit la liste des indices des indicateurs dans la dtm qui sont déjà taggés et ne nécessitent donc pas de prédiction pour l'active learning.
+
+Pour illustrer le contenu de cet objet, on fournit la liste des indices associés à l'indicateur numéro 8990 pour chaque couple indicateur x tag.
+```{r}
+done_id=unique(c(test_ind,train_ind)%%nb_indicateurs)
+max(done_id)
+done_id=expand.grid((0:(length(tags)-1)*nb_indicateurs),done_id)%>%{.$Var1+.$Var2}
+done_id%>%{.[.%%nb_indicateurs==8990]}
+```
+
+Puis on extrait la dtm des indicateurs non taggés.
+
+```{r}
+untagged_dtm=dtm_sp[setdiff(dimnames(dtm_sp)[[1]],as.character(done_id)),
+                    ngrams_tagged]
+```
+
+
+On vérifie qu'on retrouve bien tous nos `r length(tags)` tags et que chaque tag a le même nombre d'indicateur. Lorsqu'on manipule les donner dans tous les sens il faut régulièrement vérifier qu'on n'a pas fait n'importe quoi.
+```{r}
+table((as.numeric(dimnames(untagged_dtm)[[1]])-1)%/%nb_indicateurs)
+```
+
+### Prédiction pour les indicateurs non taggés
+
+Le temps de prédiction dépend linéairement du nombre d'arbre dans le modèle, d'où le besoin de limiter le nombre d'arbres.
+```{r}
+system.time(prediction <- predict(object=xgbmodel,
+                        newdata = as(untagged_dtm,"dgCMatrix")))
+pred <- data.frame(id=as.numeric(dimnames(untagged_dtm)[[1]]),
+                   pred=prediction,notion=untagged_dtm[,"notions"])
+pred=data.table(pred)
+```
+
+On va hacker les predictions avec les notions. La variable notion est déjà codée TRUE/FALSE qui deviendra 1/0 par coercion en numérique, on peut donc la voir comme une proba/prédiction. On remarquera le recours à `pmax` pour le max sur les lignes.
+
+```{r}
+pred$pred=pmax(pred$pred,pred$notion)
+```
+
+Pour l'instant on a ça :
+```{r}
+head(pred)
+```
+
+
+Ces IDs ne sont pas très exploitables, on veut récupérer l'index du tag et de l'indicateur puis les noms des tags et indicateurs.
+
+```{r}
+pred$tag_id=1+(as.numeric(as.character(pred$id))-1)%/%nb_indicateurs
+pred$indic_id=1+(as.numeric(as.character(pred$id))-1)%%nb_indicateurs
+nb_indicateurs_a_tagger=uniqueN(pred$indic_id)
+nb_indicateurs_a_tagger
+```
+Maintenant on a ça : 
+```{r}
+head(pred)
+```
+
+```{r}
+pred=merge(pred,tags_corres,by="tag_id")
+```
+
+On ordonne pred par valeur de prediction puis par indicateur. Ainsi on pourra aisément récupérer les tags "favoris"
+```{r}
+setorder(pred,-pred,indic_id)
+pred$tags=as.character(pred$tags)
+```
+
+### Proba => Décision
+
+#### Seuil sur la fréquence réelle (empirique)
+
+On va calculer la fréquence réelle des tags dans la base puis la comparer avec la prédiction moyenne.
+```{r}
+freq_tags=tagged_triplet[,list(frequence=mean(value)),by="variable"]
+pred_with_freq=merge(pred,freq_tags,by.x="tags",by.y="variable")
+nrow(pred_with_freq)/nrow(pred)# Si 1, alors jointure OK, sinon il y a un pb dans les noms des tags.
+
+pred_with_freq[,list(pred=mean(pred)),by="tags"]%>%merge(freq_tags,by.x="tags",by.y="variable")%>%View
+```
+
+On observe un décalage important entre prédiction moyenne et fréquence réelle pour certains indicateurs. Pour le moment on utilise les prédictions mais il va falloir "trancher" ie décider quelques tags sont appliqués et quels tags sont refusés ce qui nous donnera une fréquence davantage comparable à la fréquence réelle.
+
+
+Par exemple si on prenait la décision de retenir les tags lorsque la prédiction est supérieure à X% de la fréquence empirique, on obtiendrait ces répartitions.
+```{r}
+
+pred_with_freq[,list("nb_tags_applied"=mean(pred>frequence*.9)),by="tags"]%>%
+  merge(freq_tags,by.x="tags",by.y="variable")%>%
+  mutate(ratio=nb_tags_applied/frequence)%>%
+  {ggplot(.,aes(x=tags,label=ratio))+
+      geom_point(aes(y=nb_tags_applied),color="red")+
+      geom_point(aes(y=frequence),color="blue")+
+      theme(axis.text.x = element_blank())}%>%ggplotly
+```
+
+Cette stratégie n'est pas très satisfaisante dans notre cas. On observe des ratios énormes x10, voire davantage.
+
+#### Calage sur marge
+
+Une fois encore on va s'appuyer sur la fréquence réelle et appliquer les tags aux indicateurs de sorte à garantir la cohérence des fréquences. Dans ce cas là c'est la distribution des tags par indicateur qui va nous inquiéter. Le métier nous a indiqué qu'il faudrait au moins 1 tag (la liste a été construite de façon à donner une vue exhaustive des thématiques de la santé) par indicateur et au plus 4-5.
+
+```{r}
+pred_with_freq[,round(frequence*.N,0)[1],by="tags"]
+pred_with_freq[,rank:=1:.N,by="tags"]
+nb_tags_per_indic=pred_with_freq[rank<=round(frequence*nb_indicateurs_a_tagger,0),
+                                 list(nb_tags=.N),by="indic_id"]
+
+
+
+hist(nb_tags_per_indic$nb_tags)
+table(nb_tags_per_indic$nb_tags)
+```
+
+Cette méthode ne respecte pas les règles proposées par le métier. On compte des indicateurs avec aucun tag et d'autre avec une vingtaine de tags... 
+
+
+On souhaite comprendre pourquoi les tags sont ainsi distribués, est-ce que notre modèle est biaisé ?
+
+```{r}
+nrow(nb_tags_per_indic)/nrow(pred_with_freq)# fraction des tags possibles attribués
+nrow(nb_tags_per_indic)/nb_indicateurs_a_tagger# nombre moyen de tags par indicateur
+# nb_tags_per_indic$indic_id[!nb_tags_per_indic$indic_id%in%pred$indic_id]
+nb_tags_per_indic=merge(nb_tags_per_indic,data2[,c("index","Indicateur_enriched","Indicateur","Producteur","Producteur de la base")],by.x="indic_id",by.y="index")
+setorder(nb_tags_per_indic,-nb_tags)
+
+head(nb_tags_per_indic$Indicateur)
+tail(nb_tags_per_indic$Indicateur)
+```
+
+On se rend compte que les longs noms d'indicateurs semble davantage taggés, c'est un biais contre lequel on ne peut pas grand chose, notre modèle est basé sur la présence de mots clefs, plus un nom d'indicateur est long plus il peut contenir des mots clefs plus il peut être associé à des tags.
+
+Vérifions cette intuition.
+
+```{r}
+nb_tags_per_indic$nb_lettres_full=nchar(nb_tags_per_indic$Indicateur_enriched)
+nb_tags_per_indic$nb_mots_full=str_count(nb_tags_per_indic$Indicateur_enriched," ")+1
+nb_tags_per_indic$nb_lettres=nchar(nb_tags_per_indic$Indicateur)
+nb_tags_per_indic$nb_mots=str_count(nb_tags_per_indic$Indicateur," ")+1
+
+cor(nb_tags_per_indic[,c("nb_tags","nb_lettres","nb_mots")])
+cor(nb_tags_per_indic$nb_tags,nb_tags_per_indic$nb_mots,method = "pearson")
+
+```
+
+Corrélation 5% entre le nombre de tags et le nombre de mots, c'est positif mais faible.
+
+Une autre hypothèse serait la pertinence du nommage par les producteurs, comparrons les taux de tagging par producteur.
+
+```{r}
+stats_per_prod=nb_tags_per_indic[,list(volume=.N,moyenne=mean(nb_tags),decile1=quantile(nb_tags,.1),mediane=quantile(nb_tags,.5),decile9=quantile(nb_tags,.9)),by="Producteur de la base"]
+setorder(stats_per_prod,-volume)
+head(stats_per_prod,10)
+stats_per_prod$num=1:nrow(stats_per_prod)
+stats_per_prod$`Producteur de la base`=reorder(stats_per_prod$`Producteur de la base`,-stats_per_prod$volume)
+g <- ggplot(stats_per_prod[volume>100],aes(x=`Producteur de la base`,label=volume))+
+  geom_bar(aes(y=decile9),stat="identity",fill="#ff0000")+
+  geom_bar(aes(y=moyenne),stat="identity",fill="#ff6600")+
+  geom_bar(aes(y=mediane),stat="identity",fill="#ff9933")+
+  geom_bar(aes(y=decile1),stat="identity",fill="#ffcc00")+
+theme(axis.text.x = element_blank(),axis.ticks.x = element_blank())
+      
+g%>%ggplotly
+```
+
+Entre la DREES, la CNAMTS et la FNORS qui sont les 3 plus gros producteurs, on observe des différences importantes dans le nombre de tags appliqués. 
+
+
+Une hypothèse pourrait être la différence de type d'indicateurs produits par la DREES comparée au reste de l'écosystème. Aucun indicateurs DREES n'étant taggé, il est probablement difficile d'appliquer les tags sur cet échantillon atypique.
+
+#### Exercice : 
+
+Essayer d'implémenter une allocation qui respecte à la fois
+
+- la contrainte de cohérence avec les fréquences réelles
+- la contrainte d'allouer entre 1 et 5 tags par indicateur
+
+
+** solution **
+
+On commence par récupérer le tag favori pour chaque indicateur. Pour cela on crée un classement de tags par indicateur, le `rank_tag==1` est le favori qu'on devra toujours garder.
+```{r}
+setorder(pred_with_freq,-pred)
+pred_with_freq[,rank_tag:=1:.N,by="indic_id"]
+```
+
+```{r}
+pred_with_freq[,"nombre_a_allouer":=frequence*nb_indicateurs_a_tagger]
+pred_with_freq[rank_tag==1,"deja_alloue_top1":=.N,by="tags"]
+pred_with_freq[is.na(deja_alloue_top1),deja_alloue_top1:=0]
+
+
+```
+
+```{r}
+favori=pred_with_freq[rank_tag==1]
+reste=pred_with_freq[rank_tag>1&rank_tag<=5]
+reste=reste[rank<=nombre_a_allouer-deja_alloue_top1]
+choix_pred=rbind(favori,reste)
+```
+
+
+On vérifie la fréquence des tags
+
+```{r}
+choix_pred[,list(nb_tags_applied=.N/nb_indicateurs_a_tagger,frequence=frequence[1]),by="tags"]%>%
+mutate(ratio=nb_tags_applied/frequence)%>%
+  {ggplot(.,aes(x=tags,label=ratio))+
+      geom_point(aes(y=nb_tags_applied),color="red")+
+      geom_point(aes(y=frequence),color="blue")+
+      theme(axis.text.x = element_blank())}%>%ggplotly
+```
+
+```{r}
+choix_pred=merge(choix_pred,data2[,c("index","Indicateur_enriched","Indicateur","Producteur","Producteur de la base")],by.x="indic_id",by.y="index")
+
+```
+
+On vérifie la distribution des tags par indicateur
+
+```{r}
+setnames(choix_pred,"Producteur de la base","Producteur_de_la_base")
+stats_per_prod=choix_pred[
+  ,list(nb_tags=.N,"Producteur_de_la_base"=Producteur_de_la_base[1]),
+  by="indic_id"]
+table(stats_per_prod$nb_tags)
+stats_per_prod=stats_per_prod[ ,list(volume=.N,
+        moyenne=mean(nb_tags),
+        decile1=quantile(nb_tags,.1),
+        mediane=quantile(nb_tags,.5),
+        decile9=quantile(nb_tags,.9)),
+  by="Producteur_de_la_base"]
+
+setorder(stats_per_prod,-volume)
+head(stats_per_prod,10)
+stats_per_prod$num=1:nrow(stats_per_prod)
+stats_per_prod$Producteur_de_la_base=reorder(stats_per_prod$Producteur_de_la_base,-stats_per_prod$volume)
+g <- ggplot(stats_per_prod[volume>100],aes(x=Producteur_de_la_base,label=volume))+
+  geom_bar(aes(y=decile9),stat="identity",fill="#ff0000")+
+  geom_bar(aes(y=moyenne),stat="identity",fill="#ff6600")+
+  geom_bar(aes(y=mediane),stat="identity",fill="#ff9933")+
+  geom_bar(aes(y=decile1),stat="identity",fill="#ffcc00")+
+theme(axis.text.x = element_blank(),axis.ticks.x = element_blank())
+      
+g%>%ggplotly
+```
+
+
+
+
+
+#### Tirage d'un nombre fixe de tags
+
+```{r}
+indicateurs_pred=pred[,list(tag1=tags[1],
+                            prob_tag1=pred[1],
+                            tag2=tags[2],
+                            prob_tag2=pred[2],
+                            tag3=tags[3],
+                            prob_tag3=pred[3],
+                            tag4=tags[4],
+                            prob_tag4=pred[4],
+                            tag5=tags[5],
+                            prob_tag5=pred[5]
+                            # max_prob=max(pred),
+                            # min_prob=min(pred),
+                            # sum_prob=sum(pred)
+                            ),
+                      by=c("indic_id")]
+table(c(indicateurs_pred$tag1,indicateurs_pred$tag2,indicateurs_pred$tag3,indicateurs_pred$tag4,indicateurs_pred$tag5))
+
+```
+
+On apparie avec les données sources
+```{r}
+indicateurs_pred=merge(indicateurs_pred,data2,by.x="indic_id",by.y="index")
+```
+
+
+On peut vérifier visuellement la cohérence des tags avec les ngrams influents.
+
+```{r}
+consistency_imp_word=merge(indicateurs_pred,get_imp_ngrams,by.x="indic_id",by.y="i")
+setorder(consistency_imp_word,prob_tag1)
+# View(consistency_imp_word)
+```
+
+
+# Active Learning
