@@ -10,7 +10,16 @@ output:
     toc_depth: 4
 ---
 
+Ce tutoriel pour le projet de tagging des indicateurs de santé est un vrai projet de bout en bout, de la préparation des données à la restitution de résultats.
 
+Vous pouvez librement digresser au cours de l'étude et pour vous y encourager, 3 exercices vous sont proposés : 
+
+- appliquer des méthodes de calcul de distance entre chaînes de caractères pour identifier des indicateurs semblables et appliquer des techniques type k-NN
+- modéliser le nombre de tags par indicateur
+- finaliser une application shiny d'active learning
+
+
+L'application de restitution est hors programme mais vous pouvez la consulter (ici)[https://drees.shinyapps.io/Cartographie_des_indicateurs/]
 
 
 ```{r setup, include=FALSE}
@@ -30,6 +39,7 @@ library(rdrop2)
 library(ggplot2)
 library(plotly)
 library(magrittr)
+library(slam)
 library(stringdist)
 library(xgboost)
 # GESTION DE LA CONVERSION DES NOMBRES EN CHAINE DE CARACTERES SANS UTILISER LA NOTATION SCIENTIFIQUE
@@ -55,7 +65,7 @@ Les données sont principalement textuelles, certaines peut-être plus exploitab
 
 ```{r head and names}
 names(data2)
-head(data2,2)#Un View(head(data2,100)) sera peut-être plus approprié pour vous.
+head(data2)#Un View(head(data2,100)) sera peut-être plus approprié pour vous.
 ```
 
 ### Variables doublons
@@ -165,6 +175,7 @@ On va compter les espaces pour se donner une idée du nombre de mots
 str_count(data2$Indicateur," ")%>%hist(main="Distribution du nombre de mots dans le texte")
 ```
 
+
 ## Les tags
 
 ### Aperçu 
@@ -243,9 +254,13 @@ tagged_triplet=reshape::melt(tagged,id.vars="index")
 head(tagged_triplet)
 ```
 
+
+
+
 ## Base indicateurs x tags
 
 ### Jointure
+
 ```{r}
 tagged_triplet=merge(tagged_triplet,data2%>%select(index,Base,Indicateur),by="index") %>% mutate_if(is.factor,as.character)
 
@@ -444,6 +459,8 @@ j=summary(dtm)$j
 dimnm=dimnames(dtm)
 ```
 
+
+
 ### Les notions
 
 #### Aperçu 
@@ -586,6 +603,26 @@ match_notions_indic=unique(match_notions_indic[,c("i","tag_id","j")])
 ```
 
 
+#### Performance des notions
+
+```{r}
+names(tags_ok)
+
+performance_notions_seules=tags_ok%>%
+  group_by(variable)%>%
+  summarise(nb_positif=sum(value),
+         nb_negatif=sum(1-value),
+         nb_vrai_positifs=sum(value*!is.na(notion)),
+         nb_vrai_negatifs=sum((1-value)*is.na(notion)),
+         tvp=nb_vrai_positifs/nb_positif,
+         tvn=nb_vrai_negatifs/nb_negatif,
+         fscore=(tvp+tvn)/2)%>%
+  select(variable,tvp,tvn,fscore)%>%rename(tag=variable)
+
+performance_notions_seules
+
+```
+
 ### Agrégation
 
 Ce qui peut sembler surprenant jusque là c'est qu'on a construit une grosse dtm avec tout le vocabulaire sur les indicateurs, mais pour l'apprentissage on pourra se servir uniquement du vocabulaire observé dans les indicateurs taggés !
@@ -675,6 +712,138 @@ tags[dtm_sp[i_variantes,"notions"]]
 
 
 # Machine Learning
+
+## [Prélude] Heuristiques pour le tagging
+
+Pour l'instant on va seulement distinguer les indicateurs déjà taggés des autres et on va utiliser des distances sur chaînes de caractères pour labelliser par k-plus proches voisins.
+
+### Fréquence des tags par producteur
+
+On vérifie la fréquence de tags par producteurs, on pourra faire de même pour toutes les autres variables catégorielles source, base, famille...
+
+L'idée sous-jacente est qu'il est possible/probable que certains producteurs
+
+```{r}
+indicateur_wtags=data2%>%select(index, Indicateur, Famille,Base, producteur_acronyme)
+
+indicateur_wtags=merge(indicateur_wtags,tagged,by="index",all.x=T)
+indicateur_wtags$is_tagged=!is.na(indicateur_wtags$population_generale)
+nm_tags=setdiff(names(tagged),"index")
+indicateur_wtags=data.table(indicateur_wtags)
+stats=na.omit(indicateur_wtags)[,c(nm_tags,"producteur_acronyme"),with=F][,c(lapply(.SD,mean,na.rm=T),.N),by="producteur_acronyme"]
+stats
+```
+
+
+### Proximité entre noms d'indicateurs
+
+#### Cosine
+
+
+On commence par récupérer les vecteurs d'indicateurs et indices taggés/non-taggés.
+```{r}
+table(indicateur_wtags$Base,indicateur_wtags$is_tagged)
+sub_index=indicateur_wtags[Base=="scansanté"]$index%>%as.character()
+tagged_index=indicateur_wtags[index%in%sub_index&is_tagged]$index%>%as.character()
+tagged_indicateurs=indicateur_wtags[index%in%sub_index&is_tagged]$Indicateur
+
+to_tag_index=indicateur_wtags[index%in%sub_index&!is_tagged]$index%>%as.character()
+to_tag_indicateurs=indicateur_wtags[index%in%sub_index&!is_tagged]$Indicateur
+```
+
+La matrice risque de ne pas tenir en RAM (plusieurs Gb), dans ce cas prenez un échantillon de dtm, par exemple on peut raisonner base par base, ou producteur par producteur.
+```{r}
+i_sub=summary(dtm[sub_index,])$i
+j_sub=summary(dtm[sub_index,])$j
+dimnm_sub=dimnames(dtm[sub_index,])
+
+dt_dtm=simple_triplet_matrix(i = i_sub, j=j_sub, v=rep(1,length(j_sub)), dimnames = dimnm_sub)
+# sum(dt_dtm[sample(ncol(dt_dtm)*nrow(dt_dtm),10000)])
+
+```
+
+On calcule manuellement la matrice de similarité cosine
+
+```{r}
+similarity=tcrossprod_simple_triplet_matrix(dt_dtm)
+similarity[1:10,1:10]
+summary(c(similarity))
+```
+
+Il faut normaliser la matrice, cette étape est facultative parce que la version non normalisée est déjà exploitable.
+
+```{r}
+diag_=diag(similarity)
+diag_[1:10]
+diag_=simple_triplet_diag_matrix(sqrt(1/diag_))
+dimnames(diag_) <- list(dimnm_sub[[1]],dimnm_sub[[1]])
+# diag_ * similarity * diag_
+similarity=slam::matprod_simple_triplet_matrix(diag_,similarity)
+similarity[1:10,1:10]
+similarity=slam::matprod_simple_triplet_matrix(similarity,diag_)
+similarity[1:10,1:10]
+summary(c(similarity))
+```
+
+On regarde ce que ça donne sur un exemple. On va cibler les indicateurs non-taggés avec la similarité la plus forte avec des indicateurs déjà taggés.
+```{r}
+similarity_in_dataset=rowSums(similarity[to_tag_index,tagged_index])
+to=names(which.max(similarity_in_dataset))
+indicateur_wtags[index==as.numeric(to)]$Indicateur
+
+from=sort(similarity[to,tagged_index],decreasing = T)
+from_nm=names(from)
+indicateur_wtags[index%in%head(from_nm)]$Indicateur
+indicateur_wtags[index%in%tail(from_nm)]$Indicateur
+```
+
+
+On applique cette logique à tous les indicateurs à tagger.
+```{r}
+similarity2=similarity[to_tag_index,tagged_index]
+similarity2[1:10,1:10]
+order_sim=apply(similarity2,1,order,decreasing=T)%>%t
+
+nb_cols=length(tagged_index)
+similarity3=matrix(tagged_indicateurs[order_sim],ncol = nb_cols)
+# Les 5 plus ressemblants et les 5 plus dissemblants
+similarity3=similarity3[,c(1:5,(nb_cols-4):nb_cols)]
+rownames(similarity3) <- to_tag_indicateurs
+# View(t(similarity3))
+t(similarity3)[,1:5]
+```
+
+
+Pour aller plus loin on pourrait mettre un seuil de similarité sur les indicateurs et utiliser les tags déjà appliqués pour prédire le tag.
+
+```{r}
+to
+from_best=from[from>.7]
+freq_tags=indicateur_wtags[index%in%as.numeric(names(from_best)),nm_tags,with=F]%>%colSums()/length(from_best)
+sort(freq_tags,decreasing = T)
+```
+
+Ca a l'air de plutôt bien fonctionner... On en reste là pour cet technique de généralisation.
+
+#### [Exercice] Distances entre strings
+
+On a calculé "manuellement" les similarités cosine, maintenant utilisez le package `stringdist` pour calculer des distances entre les noms des indicateurs. Par exemple on pourra utiliser la fonction `amatch`
+```{r}
+# A VOUS DE JOUER
+methods=c("osa",
+"lv",
+"dl",
+"hamming",
+"lcs",
+"qgram",
+"cosine",
+"jaccard",
+"jw",
+"soundex")
+```
+
+
+
 
 On va maintenant passer à l'étape de construction du modèle de généralisation du  tagging avec séparation des données en échantillons d'entraînement et de test.
 
@@ -817,6 +986,7 @@ On remarque que des stopwords nous ont échappé... mais manifestement ils n'ét
 
 Si on voit les choses autrement, on peut se dire que lorsque le ngram influent est un stopwords, les autres ngrams moins influents ne sont probablement pas pertinent.
 De plus si LE ngram le plus influent est un stopword, alors l'indicateur est probablement mal taggé...
+
 
 ## Prédiction
 
@@ -993,9 +1163,9 @@ Entre la DREES, la CNAMTS et la FNORS qui sont les 3 plus gros producteurs, on o
 
 Une hypothèse pourrait être la différence de type d'indicateurs produits par la DREES comparée au reste de l'écosystème. Aucun indicateurs DREES n'étant taggé, il est probablement difficile d'appliquer les tags sur cet échantillon atypique.
 
-#### Exercice : 
+#### Exercice 1 [manipulation de données] 
 
-Essayer d'implémenter une allocation qui respecte à la fois
+**Essayer d'implémenter une allocation qui respecte à la fois**
 
 - la contrainte de cohérence avec les fréquences réelles
 - la contrainte d'allouer entre 1 et 5 tags par indicateur
@@ -1071,7 +1241,13 @@ g%>%ggplotly
 ```
 
 
+#### Exercice 2 [modélisation]
 
+** Modéliser le nombre de tags à appliquer à un indicateur**
+
+L'avantage de cette démarche est qu'elle peut être appliquée directement sur la dtm des indicateurs sans croisements avec les tags donc 35x moins de lignes... C'est l'occasion d'utiliser tout votre inventaire de modèles sur ce petit jeu de 6000 indicateurs taggés.
+
+**A VOUS DE JOUER !**
 
 
 #### Tirage d'un nombre fixe de tags
@@ -1111,4 +1287,242 @@ setorder(consistency_imp_word,prob_tag1)
 ```
 
 
+
 # Active Learning
+
+Les applications shiny sont le support parfait pour créer une application d'active learning à fournir aux usagers métier.
+
+## Le squelette
+
+Pour bien faire les choses on décompose l'application en 3 scripts `ui.R` `server.R` et `global.R`.
+
+```{r eval=F}
+library(shiny)
+runApp(list(
+    ui = fluidPage(title = "Tagging des indicateurs",
+      shiny::tags$h1("Tagging des indicateurs")
+    ),
+    server = function(input, output) {
+    }
+  ))
+```
+
+## Le choix des tags
+
+On ajoute une barre de sélection pour que l'utilisateur puisse choisir les tags à appliquer.
+```{r eval=F}
+runApp(list(
+    ui = fluidPage(title = "Tagging des indicateurs", 
+            shiny::tags$h1("Tagging des indicateurs"),
+            selectizeInput('tags', 'Choix des tags', choices=tags_corres$tags,multiple=T)
+    ),
+    server = function(input, output) {
+    }
+  ))
+```
+
+## L'indicateur à tagger
+
+Mais avant d'appliquer des tags, il faut que l'utilisateur ait un indicateur à étudier.
+```{r eval=F}
+### DANS LE global.R
+library(DT)
+indicateurs_pred$prob_sum=rowSums(indicateurs_pred[,paste0("prob_tag",1:5)])
+setorder(indicateurs_pred,prob_sum)
+var_a_afficher=c("Base","Indicateur","Famille",
+       "Classement producteur Niveau 1 (le moins détaillé)",
+       "Classement producteur Niveau 2",
+       "Classement producteur Niveau 3 (le plus détaillé)","source_acronyme","producteur_acronyme",paste0("tag",1:5))
+
+# SERVER
+servr=function(input, output) {
+      output$table=renderDT(datatable(indicateurs_pred[1,var_a_afficher,with=F]))
+}
+# UI
+ui_carto = fluidPage(title = "Tagging des indicateurs", 
+            shiny::tags$h1("Tagging des indicateurs"),
+            selectizeInput('tags', 'Choix des tags', choices=tags_corres$tags,multiple=T),
+            DTOutput("table")
+    )
+
+runApp(list(
+    ui = ui_carto,
+    server = servr
+  ))
+```
+
+## Ajout d'une sidebar
+
+Pour clarifier l'application on propose un découpage en colonnes afin de bien séparer la partie où l'utilisateur peut agir (choix des tags) de la partie lecture.
+```{r eval=F}
+# UI
+ui_carto = fluidPage(title = "Tagging des indicateurs", 
+            sidebarPanel(
+              shiny::tags$h1("Choix des tags"),
+              selectizeInput('tags', 'Choix multiples parmi 35', choices=tags_corres$tags,multiple=T)),
+            mainPanel(
+              shiny::tags$h1("L'indicateur à tagger"),
+              DTOutput("table"))
+    )
+
+runApp(list(
+    ui = ui_carto,
+    server = servr
+  ))
+
+
+```
+
+## Autres interactions avec l'utilisateur
+
+Ajout d'un bouton de validation, un autre bouton pour passer l'indicateur, un dernier pour relancer le modèle et la prédiction.
+
+On ajoute des icones aux boutons en cherchant dans le catalogue [font-awesome](https://fontawesome.com/)
+
+
+```{r eval=F}
+# UI
+ui_carto = fluidPage(title = "Tagging des indicateurs", 
+            sidebarPanel(
+              shiny::tags$h1("Choix des tags"),
+              selectizeInput('tags', 'Choix multiples parmi 35',  choices=tags_corres$tags,multiple=T),
+              actionButton("submit_tags","Valider",icon=icon("check-circle")),
+actionButton("skip","Passer",icon=icon("fast-forward")),
+actionButton("rerun","Re-Lancer",icon=icon("cogs"))
+
+              ),
+            mainPanel(
+              shiny::tags$h1("L'indicateur à tagger"),
+              DTOutput("table"))
+    )
+
+runApp(list(
+    ui = ui_carto,
+    server = servr
+  ))
+```
+
+
+## Passer l'indicateur
+
+Maintenant on passe à la logique côté serveur, plus complexe à gérer. On va commencer par le plus simple, passer l'indicateur et afficher le suivant.
+Pour cela on a besoin de gérer une liste d'indicateurs déjà traités (taggés ou passés). Pour cela on aura recours à des reactifs.
+
+
+```{r eval=F}
+# SERVER
+servr=function(input, output) {
+  index_done=reactiveVal(0)
+  output$table=renderDT(datatable(indicateurs_pred[!indic_id%in%index_done()][1,var_a_afficher,with=F]))
+  observeEvent(input$skip,{
+    curr_index=indicateurs_pred[!indic_id%in%index_done()][1]$indic_id
+    print("Ajout à la liste des indices traités")
+    print(curr_index)
+    index_done(c(index_done(),curr_index))
+  })
+}
+
+
+runApp(list(
+    ui = ui_carto,
+    server = servr
+  ))
+```
+
+## Valider les tags
+
+### Cas de base 
+
+On commence par gérer un cas de base important, lorsque l'utilisateur clique sur "valider" sans avoir renseigné de tags.
+
+```{r eval=F}
+# SERVER
+servr=function(input, output) {
+  index_done=reactiveVal(0)
+  output$table=renderDT(datatable(indicateurs_pred[!indic_id%in%index_done()][1,var_a_afficher,with=F]))
+  observeEvent(input$skip,{
+    curr_index=indicateurs_pred[!indic_id%in%index_done()][1]$indic_id
+    print("Ajout à la liste des indices traités")
+    print(curr_index)
+    index_done(c(index_done(),curr_index))
+  })
+  observeEvent(input$submit_tags,{
+    if(length(input$tags)==0){
+      showModal(modalDialog(easyClose = T,size = "s",
+        title = "Attention",
+        "Si vous ne renseignez aucun tag, il est préférable de cliquer sur 'passer' pour passer à l'indicateur suivant sans appliquer de tag à celui-ci"
+      ))
+    }
+  })
+  
+}
+
+
+runApp(list(
+    ui = ui_carto,
+    server = servr
+  ))
+```
+
+### Enregistrement de l'indicateur taggé
+
+On doit récupérer l'information sur l'indicateur fraîchement taggé et la structurer pour l'ajouter à `tagged_triplet`. Avant de lancer le code, essayer par vous même, jeter d'abord un oeil à `names(tagged_triplet)`.
+
+```{r eval=F}
+# GLOBAL
+
+tagged_triplet_bis=tagged_triplet
+# SERVER
+servr=function(input, output,session) {
+  index_done=reactiveVal(0)
+  
+  add_tags=reactiveVal(0)
+  
+  output$table=renderDT(datatable(indicateurs_pred[!indic_id%in%index_done()][1,var_a_afficher,with=F]))
+  observeEvent(input$skip,{
+    curr_index=indicateurs_pred[!indic_id%in%index_done()][1]$indic_id
+    print("Ajout à la liste des indices traités")
+    print(curr_index)
+    index_done(c(index_done(),curr_index))
+  })
+  observeEvent(input$submit_tags,{
+    if(length(input$tags)==0){
+      showModal(modalDialog(easyClose = T,size = "s",
+        title = "Attention",
+        "Si vous ne renseignez aucun tag, il est préférable de cliquer sur 'passer' pour passer à l'indicateur suivant sans appliquer de tag à celui-ci"
+      ))
+    } else if (length(input$tags)>0){
+      print(input$tags)
+      curr_index=indicateurs_pred[!indic_id%in%index_done()][1]$indic_id
+      infos_indicateur=indicateurs_pred[!indic_id%in%index_done()][1]%>%select(indic_id,Base,Indicateur)%>%rename(id=indic_id)
+      tags_applied=data.table(tags_corres)
+      setnames(tags_applied,"tags","variable")#Parce que le tag s'appelle comme ça dans tagged_triplet
+      tags_applied$value=0#initialisation
+      tags_applied[tags%in%input$tags,value:=1]
+      infos_indicateur=cbind(infos_indicateur,tags_applied)
+      infos_indicateur$i=infos_indicateur$tag_id*infos_indicateur$id
+      index_done(c(index_done(),curr_index))
+      print(nrow(tagged_triplet_bis))
+      tagged_triplet_bis <<- rbind(tagged_triplet_bis,infos_indicateur)
+      print(nrow(tagged_triplet_bis))
+      updateSelectizeInput(session = session,inputId = "tags", choices=tags_corres$tags)
+    }
+  })
+  
+}
+
+
+runApp(list(
+    ui = ui_carto,
+    server = servr
+  ))
+
+```
+
+
+### Ré-entraînement du modèle
+
+Vous disposez de tout le code nécessaire, attention à ne pas relancer des étapes inutiles, il vous suffira de partir de la section `Machine Learning > Préparation > Echantillonnage train-test`.
+
+
+Bien sûr il est préférable de mettre le code dans un script .R à part et de l'invoquer avec `source`.
